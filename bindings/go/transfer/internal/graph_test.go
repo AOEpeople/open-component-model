@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -695,7 +696,10 @@ func TestBuildDescriptorSpec_NoLabelsOmitted(t *testing.T) {
 	require.True(t, ok)
 
 	labelsVal, present := componentMap["labels"]
-	if present {
-		assert.Nil(t, labelsVal, "when labels is nil, the map entry must be nil (not a CEL ref)")
-	}
+	assert.True(t, present, "labels field should be present with has() conditional")
+	assert.NotNil(t, labelsVal, "labels value should not be nil")
+	// Verify it uses has() conditional
+	labelsStr := fmt.Sprintf("%v", labelsVal)
+	assert.Contains(t, labelsStr, "has(", "labels should use has() conditional")
+	assert.Contains(t, labelsStr, "[]", "labels should default to empty slice if missing")
 }

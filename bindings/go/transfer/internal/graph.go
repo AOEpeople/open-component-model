@@ -326,8 +326,30 @@ func addDescriptorToEnvironment(v2desc *descriptorv2.Descriptor, id string, tgd 
 	if err := json.Unmarshal(rawV2Desc, &mapDesc); err != nil {
 		return fmt.Errorf("cannot unmarshal v2 descriptor: %w", err)
 	}
+	normalizeDescriptorComponentOptionalFields(mapDesc)
 	tgd.Environment.Data[id] = mapDesc
 	return nil
+}
+
+// normalizeDescriptorComponentOptionalFields ensures optional descriptor/component
+// fields are present in the environment map used for CEL type inference. Missing
+// keys would otherwise be excluded from the inferred schema and make expressions
+// that access them fail at compile time.
+func normalizeDescriptorComponentOptionalFields(descriptor map[string]any) {
+	if _, exists := descriptor["signatures"]; !exists {
+		descriptor["signatures"] = []any{}
+	}
+
+	component, ok := descriptor["component"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	for _, field := range []string{"labels", "repositoryContexts", "sources", "componentReferences"} {
+		if _, exists := component[field]; !exists {
+			component[field] = []any{}
+		}
+	}
 }
 
 // addUploadTransformation creates the final upload (AddComponentVersion) transformation
@@ -387,10 +409,10 @@ func buildDescriptorSpec(v2desc *descriptorv2.Descriptor, id string, resourceTra
 		"resources": resourcesArray,
 	}
 
-	setOptionalField(componentMap, "labels", id, v2desc.Component.Labels != nil)
-	setOptionalField(componentMap, "repositoryContexts", id, v2desc.Component.RepositoryContexts != nil)
-	setOptionalField(componentMap, "sources", id, v2desc.Component.Sources != nil)
-	setOptionalField(componentMap, "componentReferences", id, v2desc.Component.References != nil)
+	setOptionalFieldWithHas(componentMap, "labels", id)
+	setOptionalFieldWithHas(componentMap, "repositoryContexts", id)
+	setOptionalFieldWithHas(componentMap, "sources", id)
+	setOptionalFieldWithHas(componentMap, "componentReferences", id)
 
 	descSpecMap := map[string]any{
 		"meta":      fmt.Sprintf("${environment.%s.meta}", id),
@@ -404,12 +426,21 @@ func buildDescriptorSpec(v2desc *descriptorv2.Descriptor, id string, resourceTra
 	return descSpecMap
 }
 
-// setOptionalField sets a field in the component map, either as a CEL reference to the
-// environment value if present, or nil if absent.
-func setOptionalField(componentMap map[string]any, field, id string, present bool) {
-	if present {
-		componentMap[field] = fmt.Sprintf("${environment.%s.component.%s}", id, field)
-	} else {
-		componentMap[field] = nil
+// setOptionalFieldWithHas sets an optional field in the component map using a CEL has()
+// conditional. If the field exists in the environment object, it is referenced; otherwise
+// a default value is used. This handles cases where components fetched from the source
+// registry may omit optional fields during JSON marshaling.
+func setOptionalFieldWithHas(componentMap map[string]any, field, id string) {
+	var defaultValue string
+	switch field {
+	case "labels", "sources":
+		defaultValue = "[]"
+	case "repositoryContexts", "componentReferences":
+		defaultValue = "[]"
+	default:
+		defaultValue = "null"
 	}
+
+	componentMap[field] = fmt.Sprintf("${has(environment.%s.component.%s) ? environment.%s.component.%s : %s}",
+		id, field, id, field, defaultValue)
 }
