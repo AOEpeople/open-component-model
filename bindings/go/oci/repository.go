@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 	ociImageSpecV1 "github.com/opencontainers/image-spec/specs-go/v1"
@@ -49,6 +50,18 @@ import (
 var (
 	_            ComponentVersionRepository = (*Repository)(nil)
 	versionRegex                            = regexp.MustCompile(compref.VersionRegex)
+)
+
+const (
+	// blobResolveMaxAttempts is how many times to attempt resolving a local blob
+	// descriptor after upload. Some registries (e.g. Harbor) exhibit brief
+	// eventual-consistency delays between a successful push and the manifest
+	// being queryable by digest, producing spurious 404s immediately after upload.
+	blobResolveMaxAttempts = 5
+
+	// blobResolveBackoffBase is the starting duration for exponential backoff
+	// between blob resolve retries.
+	blobResolveBackoffBase = 500 * time.Millisecond
 )
 
 // Repository implements the ComponentVersionRepository interface using OCI registries.
@@ -401,7 +414,33 @@ func identifyLocalBlobManifestsAndLayers(ctx context.Context, store oras.Target,
 				}
 			}
 
-			desc, err := resolve(egctx, localBlob.LocalReference)
+			var (
+				desc ociImageSpecV1.Descriptor
+				err  error
+			)
+			for attempt := range blobResolveMaxAttempts {
+				if attempt > 0 {
+					// Some registries (e.g. Harbor) need a moment to index a manifest
+					// after upload before it is queryable by digest. Back off and retry
+					// rather than surfacing a spurious not-found to the caller.
+					backoff := blobResolveBackoffBase << (attempt - 1)
+					slog.DebugContext(egctx, "retrying local blob resolve after not-found",
+						slog.String("ref", localBlob.LocalReference),
+						slog.Int("attempt", attempt),
+						slog.Duration("backoff", backoff),
+					)
+					select {
+					case <-egctx.Done():
+						return fmt.Errorf("context cancelled while retrying blob resolve for %s: %w",
+							localBlob.LocalReference, egctx.Err())
+					case <-time.After(backoff):
+					}
+				}
+				desc, err = resolve(egctx, localBlob.LocalReference)
+				if err == nil || !errors.Is(err, errdef.ErrNotFound) {
+					break // success, or a non-transient error — stop retrying
+				}
+			}
 			if err != nil {
 				return fmt.Errorf("failed to resolve descriptor for local blob %s: %w", localBlob.LocalReference, err)
 			}
