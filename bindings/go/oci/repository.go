@@ -54,14 +54,18 @@ var (
 
 const (
 	// blobResolveMaxAttempts is how many times to attempt resolving a local blob
-	// descriptor after upload. Some registries (e.g. Harbor) exhibit brief
-	// eventual-consistency delays between a successful push and the manifest
-	// being queryable by digest, producing spurious 404s immediately after upload.
-	blobResolveMaxAttempts = 5
+	// descriptor after upload. Some registries (e.g. Harbor on S3-backed storage)
+	// exhibit eventual-consistency delays of 15-120 seconds between a successful
+	// push and the manifest being queryable by digest, producing spurious 404s.
+	blobResolveMaxAttempts = 15
 
 	// blobResolveBackoffBase is the starting duration for exponential backoff
 	// between blob resolve retries.
-	blobResolveBackoffBase = 500 * time.Millisecond
+	blobResolveBackoffBase = 3 * time.Second
+
+	// blobResolveMaxBackoff caps the exponential backoff to avoid excessively
+	// long sleeps on later attempts.
+	blobResolveMaxBackoff = 30 * time.Second
 )
 
 // Repository implements the ComponentVersionRepository interface using OCI registries.
@@ -424,6 +428,9 @@ func identifyLocalBlobManifestsAndLayers(ctx context.Context, store oras.Target,
 					// after upload before it is queryable by digest. Back off and retry
 					// rather than surfacing a spurious not-found to the caller.
 					backoff := blobResolveBackoffBase << (attempt - 1)
+					if backoff > blobResolveMaxBackoff {
+						backoff = blobResolveMaxBackoff
+					}
 					slog.DebugContext(egctx, "retrying local blob resolve after not-found",
 						slog.String("ref", localBlob.LocalReference),
 						slog.Int("attempt", attempt),
