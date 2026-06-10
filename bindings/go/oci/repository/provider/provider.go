@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/retry"
@@ -43,6 +44,12 @@ type CachingComponentVersionRepositoryProvider struct {
 	// The cache avoids creating multiple stores operating on the same files,
 	// which is required to avoid race conditions.
 	storeCache *storeCache
+
+	// ociRepoCache caches *oci.Repository instances keyed by registry base URL.
+	// This ensures state like descriptorCache (used to bypass eventually-consistent
+	// HEAD calls on S3-backed registries such as Harbor) is shared across all
+	// transformer nodes that operate on the same target registry within a session.
+	ociRepoCache sync.Map
 
 	// httpClient is the shared HTTP client used by all repositories provided.
 	httpClient *http.Client
@@ -149,7 +156,18 @@ func (b *CachingComponentVersionRepositoryProvider) GetComponentVersionRepositor
 			}
 		}
 
-		return ocirepository.NewFromOCIRepoV1(ctx, obj, &auth.Client{
+		// Use the base URL as the cache key. Within a single transfer session the
+		// target registry and credentials are constant, so reusing the same
+		// Repository instance is safe and necessary: the per-instance descriptorCache
+		// must be shared between AddLocalResource and AddComponentVersion transformer
+		// nodes so that freshly-pushed manifests can be resolved without a round-trip
+		// to the registry (which may be temporarily inconsistent on S3-backed storage).
+		cacheKey := obj.BaseUrl
+		if cached, ok := b.ociRepoCache.Load(cacheKey); ok {
+			return cached.(*oci.Repository), nil
+		}
+
+		repo, err := ocirepository.NewFromOCIRepoV1(ctx, obj, &auth.Client{
 			Client:     b.httpClient,
 			Cache:      auth.NewCache(),
 			Credential: credentials.CredentialFunc(identity, ociCredentials),
@@ -157,6 +175,12 @@ func (b *CachingComponentVersionRepositoryProvider) GetComponentVersionRepositor
 				"User-Agent": {b.creator},
 			},
 		}, opts...)
+		if err != nil {
+			return nil, err
+		}
+
+		actual, _ := b.ociRepoCache.LoadOrStore(cacheKey, repo)
+		return actual.(*oci.Repository), nil
 	case *ctfrepospecv1.Repository:
 		loadFunc := func(path string) (*ocictf.Store, error) {
 			return ocirepository.NewStoreFromCTFRepoV1(ctx, obj, opts...)
