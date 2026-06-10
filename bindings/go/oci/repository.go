@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"sync"
 	"time"
 
 	"github.com/opencontainers/go-digest"
@@ -115,6 +116,12 @@ type Repository struct {
 	// ownershipReferrerPolicy controls asset-to-owner referrer creation on
 	// by-value resource uploads (ADR 0016). Default (zero value) is Disabled.
 	ownershipReferrerPolicy OwnershipReferrerPolicy
+
+	// descriptorCache stores descriptors of local blobs pushed in the current
+	// session. This avoids re-resolving from the registry after push, which can
+	// produce spurious 404s on registries with eventually-consistent backing
+	// storage (e.g. Harbor on S3). Keyed by digest string.
+	descriptorCache sync.Map
 }
 
 // SetGlobalAccessPolicy overrides the global access policy for this repository.
@@ -140,7 +147,7 @@ func (repo *Repository) AddComponentVersion(ctx context.Context, descriptor *des
 	localBlobs := scanLocalBlobs(descriptor)
 
 	// Validate that all referenced local blobs exist in the store
-	additionalManifests, additionalLayers, err := identifyLocalBlobManifestsAndLayers(ctx, store, localBlobs)
+	additionalManifests, additionalLayers, err := identifyLocalBlobManifestsAndLayers(ctx, store, localBlobs, &repo.descriptorCache)
 	if err != nil {
 		return fmt.Errorf("failed to validate local blobs: %w", err)
 	}
@@ -389,9 +396,28 @@ func scanLocalBlobs(desc *descriptor.Descriptor) []descriptor.Artifact {
 	return artifacts
 }
 
+// wrapResolveWithCache wraps a resolve function with a cache-first lookup.
+// If the digest is found in cache (populated by recent pushes in this session),
+// the cached descriptor is returned without a network call. This avoids
+// spurious 404s from registries with eventually-consistent backing storage.
+func wrapResolveWithCache(
+	resolve func(context.Context, string) (ociImageSpecV1.Descriptor, error),
+	cache *sync.Map,
+) func(context.Context, string) (ociImageSpecV1.Descriptor, error) {
+	if cache == nil {
+		return resolve
+	}
+	return func(ctx context.Context, ref string) (ociImageSpecV1.Descriptor, error) {
+		if v, ok := cache.Load(ref); ok {
+			return v.(ociImageSpecV1.Descriptor), nil
+		}
+		return resolve(ctx, ref)
+	}
+}
+
 // identifyLocalBlobManifestsAndLayers fetches all descriptors in the store that are available
 // for the given artifact list and the output is stable sorted based on the order of the artifact list.
-func identifyLocalBlobManifestsAndLayers(ctx context.Context, store oras.Target, artifacts []descriptor.Artifact) (manifests []ociImageSpecV1.Descriptor, layers []ociImageSpecV1.Descriptor, err error) {
+func identifyLocalBlobManifestsAndLayers(ctx context.Context, store oras.Target, artifacts []descriptor.Artifact, cache *sync.Map) (manifests []ociImageSpecV1.Descriptor, layers []ociImageSpecV1.Descriptor, err error) {
 	eg, egctx := errgroup.WithContext(ctx)
 
 	// Pre-allocate result slice to maintain order
@@ -405,7 +431,7 @@ func identifyLocalBlobManifestsAndLayers(ctx context.Context, store oras.Target,
 			// but since we dont do that we have to take actual uploaded size of the descriptor
 			// from the API again. Thats why we need to call Resolve and get the descriptor
 			// instead of just checking existence of the blob.
-			resolve := store.Resolve
+			resolve := wrapResolveWithCache(store.Resolve, cache)
 			if !introspection.IsOCICompliantMediaType(localBlob.MediaType) {
 				if bs, ok := store.(interface{ Blobs() registry.BlobStore }); ok {
 					//  TODO(jakobmoellerdev): currently, the blobs store is required
@@ -414,7 +440,7 @@ func identifyLocalBlobManifestsAndLayers(ctx context.Context, store oras.Target,
 					//    manifest blobs. Mid-Term the oras.Target interface is insufficient
 					//    and CTFs also need to implement this BlobStore and then we can drop this
 					//    assert.
-					resolve = bs.Blobs().Resolve
+					resolve = wrapResolveWithCache(bs.Blobs().Resolve, cache)
 				}
 			}
 
@@ -514,10 +540,13 @@ func (repo *Repository) uploadAndUpdateLocalArtifact(
 	if ownershipReferrerPolicy == OwnershipReferrerPolicyEnabled {
 		packOptions.Referrers = []tar.ReferrersFunc{pack.OwnershipReferrer(artifact, component, version)}
 	}
-	_, err = pack.ArtifactBlob(ctx, store, artifactBlob, packOptions)
+	desc, err := pack.ArtifactBlob(ctx, store, artifactBlob, packOptions)
 	if err != nil {
 		return fmt.Errorf("failed to pack resource blob: %w", err)
 	}
+	// Cache the descriptor so AddComponentVersion can skip re-resolving
+	// from the registry, which may be eventually consistent (e.g. Harbor on S3).
+	repo.descriptorCache.Store(desc.Digest.String(), desc)
 
 	return nil
 }
