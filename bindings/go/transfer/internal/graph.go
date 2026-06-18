@@ -410,9 +410,9 @@ func buildDescriptorSpec(v2desc *descriptorv2.Descriptor, id string, resourceTra
 	}
 
 	setOptionalFieldWithHas(componentMap, "labels", id)
-	setOptionalFieldWithHas(componentMap, "repositoryContexts", id)
+	setOptionalFieldFromDescriptor(componentMap, "repositoryContexts", v2desc.Component.RepositoryContexts)
 	setOptionalFieldWithHas(componentMap, "sources", id)
-	setOptionalFieldWithHas(componentMap, "componentReferences", id)
+	setOptionalFieldFromDescriptor(componentMap, "componentReferences", v2desc.Component.References)
 
 	descSpecMap := map[string]any{
 		"meta":      fmt.Sprintf("${environment.%s.meta}", id),
@@ -435,12 +435,34 @@ func setOptionalFieldWithHas(componentMap map[string]any, field, id string) {
 	switch field {
 	case "labels", "sources":
 		defaultValue = "[]"
-	case "repositoryContexts", "componentReferences":
-		defaultValue = "[]"
 	default:
 		defaultValue = "null"
 	}
 
 	componentMap[field] = fmt.Sprintf("${has(environment.%s.component.%s) ? environment.%s.component.%s : %s}",
 		id, field, id, field, defaultValue)
+}
+
+// setOptionalFieldFromDescriptor writes a descriptor field into the upload spec
+// without CEL property access. This avoids CEL type-check failures for optional
+// fields that may be absent from inferred environment object types.
+func setOptionalFieldFromDescriptor(componentMap map[string]any, field string, value any) {
+	if value == nil {
+		componentMap[field] = []any{}
+		return
+	}
+
+	raw, err := json.Marshal(value)
+	if err != nil {
+		componentMap[field] = []any{}
+		return
+	}
+
+	var converted any
+	if err := json.Unmarshal(raw, &converted); err != nil {
+		componentMap[field] = []any{}
+		return
+	}
+
+	componentMap[field] = converted
 }
