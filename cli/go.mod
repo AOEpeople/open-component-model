@@ -34,7 +34,7 @@ require (
 	ocm.software/open-component-model/bindings/go/input/utf8 v0.0.0-20260616162616-fac66c3e8710
 	ocm.software/open-component-model/bindings/go/oci v0.0.46
 	ocm.software/open-component-model/bindings/go/plugin v0.0.17
-	ocm.software/open-component-model/bindings/go/repository v0.0.9
+	ocm.software/open-component-model/bindings/go/repository v0.0.10
 	ocm.software/open-component-model/bindings/go/rsa v0.0.0-20260616162616-fac66c3e8710
 	ocm.software/open-component-model/bindings/go/runtime v0.0.8
 	ocm.software/open-component-model/bindings/go/signing v0.0.0-20260616162616-fac66c3e8710
@@ -140,4 +140,5 @@ require (
 )
 
 replace ocm.software/open-component-model/bindings/go/transfer => ../bindings/go/transfer
+
 replace ocm.software/open-component-model/bindings/go/oci => ../bindings/go/oci
