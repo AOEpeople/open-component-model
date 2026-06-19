@@ -104,7 +104,7 @@ func CopyOCILayoutWithIndex(ctx context.Context, dst content.Storage, src blob.R
 		err = errors.Join(err, ociStore.Close())
 	}()
 
-	index, err := pickTopLevelDescriptor(ociStore)
+	index, err := pickTopLevelDescriptor(ctx, ociStore)
 	if err != nil {
 		return ociImageSpecV1.Descriptor{}, err
 	}
@@ -151,11 +151,11 @@ func CopyOCILayoutWithIndex(ctx context.Context, dst content.Storage, src blob.R
 }
 
 // pickTopLevelDescriptor selects the single top-level manifest from the
-// layout's index.json. With one manifest in the index it returns that
-// manifest; with many it returns the one tagged via
-// `org.opencontainers.image.ref.name`. Returns an error if neither rule
-// uniquely identifies a top-level descriptor.
-func pickTopLevelDescriptor(ociStore *CloseableReadOnlyStore) (ociImageSpecV1.Descriptor, error) {
+// layout's index.json: the sole manifest if there is one, else the sole
+// manifest tagged `org.opencontainers.image.ref.name`, else — when neither is
+// unique — the sole main artifact once MainArtifacts partitions out referrers.
+// Returns an error if none of these uniquely identify a top-level descriptor.
+func pickTopLevelDescriptor(ctx context.Context, ociStore *CloseableReadOnlyStore) (ociImageSpecV1.Descriptor, error) {
 	if len(ociStore.Index.Manifests) == 1 {
 		return ociStore.Index.Manifests[0], nil
 	}
@@ -167,6 +167,11 @@ func pickTopLevelDescriptor(ociStore *CloseableReadOnlyStore) (ociImageSpecV1.De
 	}
 	if len(named) == 1 {
 		return ociStore.Index.Manifests[named[0]], nil
+	}
+	// Fallback: no usable ref.name (e.g. an artifact stored alongside its referrer).
+	// MainArtifacts drops referrers via their subject edge; a lone survivor is the root.
+	if mains := ociStore.MainArtifacts(ctx); len(mains) == 1 {
+		return mains[0], nil
 	}
 	return ociImageSpecV1.Descriptor{}, fmt.Errorf(
 		"multiple manifests found in oci store, "+
