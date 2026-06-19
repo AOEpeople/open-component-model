@@ -492,3 +492,75 @@ func (b *testReadOnlyBlob) ReadCloser() (io.ReadCloser, error) {
 func (b *testReadOnlyBlob) Close() error {
 	return nil
 }
+
+// TestCopyOCILayoutWithIndex_MainArtifactFallback exercises the MainArtifacts fallback:
+// an untagged artifact + its referrer share the index with no ref.name to disambiguate.
+// MainArtifacts drops the referrer (it declares a subject) and returns the artifact as
+// root; the referrer must still reach dst as a predecessor.
+func TestCopyOCILayoutWithIndex_MainArtifactFallback(t *testing.T) {
+	r := require.New(t)
+	layoutBytes, mainDesc, refDesc := buildMultiManifestLayoutNoRefName(t)
+
+	dst := memory.New()
+	returnedTop, err := CopyOCILayoutWithIndex(t.Context(), dst, &testReadOnlyBlob{data: layoutBytes}, CopyOCILayoutWithIndexOptions{})
+	r.NoError(err)
+
+	assert.Equal(t, mainDesc.Digest, returnedTop.Digest, "the main artifact, not its referrer, must be picked as root")
+
+	okMain, err := dst.Exists(t.Context(), mainDesc)
+	r.NoError(err)
+	assert.True(t, okMain, "main artifact root must be copied to dst")
+
+	okRef, err := dst.Exists(t.Context(), refDesc)
+	r.NoError(err)
+	assert.True(t, okRef, "referrer must reach dst as a predecessor of the root")
+}
+
+// buildMultiManifestLayoutNoRefName builds a layout whose index lists an artifact and a
+// referrer (subject → artifact), neither carrying a ref.name annotation.
+func buildMultiManifestLayoutNoRefName(t *testing.T) (layoutBytes []byte, mainDesc, refDesc ociImageSpecV1.Descriptor) {
+	t.Helper()
+	r := require.New(t)
+	ctx := t.Context()
+
+	var buf bytes.Buffer
+	w, err := NewOCILayoutWriterWithTempFile(&buf, t.TempDir())
+	r.NoError(err)
+
+	layerData := []byte("layer content")
+	layer := content.NewDescriptorFromBytes(ociImageSpecV1.MediaTypeImageLayer, layerData)
+	r.NoError(w.Push(ctx, layer, bytes.NewReader(layerData)))
+
+	mainDesc, err = oras.PackManifest(ctx, w, oras.PackManifestVersion1_1, "application/artifact", oras.PackManifestOptions{
+		Layers: []ociImageSpecV1.Descriptor{layer},
+	})
+	r.NoError(err)
+
+	empty := ociImageSpecV1.DescriptorEmptyJSON
+	if err := w.Push(ctx, empty, bytes.NewReader(empty.Data)); err != nil && !errors.Is(err, errdef.ErrAlreadyExists) {
+		r.NoError(err)
+	}
+	const artifactType = "application/test.referrer.v1+json"
+	refBody, err := json.Marshal(ociImageSpecV1.Manifest{
+		Versioned:    specs.Versioned{SchemaVersion: 2},
+		MediaType:    ociImageSpecV1.MediaTypeImageManifest,
+		ArtifactType: artifactType,
+		Config:       empty,
+		Layers:       []ociImageSpecV1.Descriptor{empty},
+		Subject:      &mainDesc,
+	})
+	r.NoError(err)
+	refDesc = ociImageSpecV1.Descriptor{
+		MediaType:    ociImageSpecV1.MediaTypeImageManifest,
+		ArtifactType: artifactType,
+		Digest:       digest.FromBytes(refBody),
+		Size:         int64(len(refBody)),
+	}
+	r.NoError(w.Push(ctx, refDesc, bytes.NewReader(refBody)))
+
+	// Tag by digest so both manifests enter index.json without a ref.name annotation.
+	r.NoError(w.Tag(ctx, mainDesc, mainDesc.Digest.String()))
+	r.NoError(w.Tag(ctx, refDesc, refDesc.Digest.String()))
+	r.NoError(w.Close())
+	return buf.Bytes(), mainDesc, refDesc
+}

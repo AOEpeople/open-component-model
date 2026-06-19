@@ -17,13 +17,8 @@ func IsOCICompliantManifest(desc ociImageSpecV1.Descriptor) bool {
 	return IsOCICompliantMediaType(desc.MediaType)
 }
 
-// IsOCICompliantMediaType checks if a media type is recognised by OCI or Docker registry
-// clients as a manifest (as opposed to a raw blob). Manifests must be pushed to and resolved
-// from the manifests endpoint (/v2/{name}/manifests/{reference}); blobs use the blobs endpoint.
-// Getting this wrong causes two cascading failures:
-//   - resolution uses the blobs endpoint → 404 (Docker manifests live in the manifest store)
-//   - classification sends the descriptor to Layers instead of AdditionalDescriptorManifests
-//     → Harbor rejects the component version index PUT with 400 "blob unknown"
+// IsOCICompliantMediaType reports whether a media type is an OCI or Docker manifest
+// (served from the manifests endpoint) rather than a raw blob.
 func IsOCICompliantMediaType(mediaType string) bool {
 	switch mediaType {
 	case ociImageSpecV1.MediaTypeImageManifest,

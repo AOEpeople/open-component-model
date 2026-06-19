@@ -151,10 +151,10 @@ func CopyOCILayoutWithIndex(ctx context.Context, dst content.Storage, src blob.R
 }
 
 // pickTopLevelDescriptor selects the single top-level manifest from the
-// layout's index.json. With one manifest in the index it returns that
-// manifest; with many it returns the one tagged via
-// `org.opencontainers.image.ref.name`. Returns an error if neither rule
-// uniquely identifies a top-level descriptor.
+// layout's index.json: the sole manifest if there is one, else the sole
+// manifest tagged `org.opencontainers.image.ref.name`, else — when neither is
+// unique — the sole main artifact once MainArtifacts partitions out referrers.
+// Returns an error if none of these uniquely identify a top-level descriptor.
 func pickTopLevelDescriptor(ctx context.Context, ociStore *CloseableReadOnlyStore) (ociImageSpecV1.Descriptor, error) {
 	if len(ociStore.Index.Manifests) == 1 {
 		return ociStore.Index.Manifests[0], nil
@@ -168,13 +168,10 @@ func pickTopLevelDescriptor(ctx context.Context, ociStore *CloseableReadOnlyStor
 	if len(named) == 1 {
 		return ociStore.Index.Manifests[named[0]], nil
 	}
-	// Fallback: identify the root manifest by reference counting. A manifest is the
-	// root if no other manifest in the index references its digest as a child, layer,
-	// subject, or platform entry. This handles layouts where an artifact is stored
-	// alongside its referrer (e.g. a container image + SPDX/SBOM document whose
-	// subject points back to the image).
-	if rootIdx, err := findRootManifestIndex(ctx, ociStore); err == nil {
-		return ociStore.Index.Manifests[rootIdx], nil
+	// Fallback: no usable ref.name (e.g. an artifact stored alongside its referrer).
+	// MainArtifacts drops referrers via their subject edge; a lone survivor is the root.
+	if mains := ociStore.MainArtifacts(ctx); len(mains) == 1 {
+		return mains[0], nil
 	}
 	return ociImageSpecV1.Descriptor{}, fmt.Errorf(
 		"multiple manifests found in oci store, "+
@@ -190,81 +187,6 @@ const (
 	mediaTypeDockerManifest     = "application/vnd.docker.distribution.manifest.v2+json"
 	mediaTypeDockerManifestList = "application/vnd.docker.distribution.manifest.list.v2+json"
 )
-
-// findRootManifestIndex identifies the unique "root" manifest when the OCI store
-// contains multiple entries in its top-level index. A manifest is a root if its
-// digest does not appear as a referenced child (config, layer, child manifest, or
-// subject) inside any other manifest in the index.
-//
-// This handles OCI layouts that store an artifact alongside its referrer — for
-// example, a container image bundled with an SPDX/SBOM document. The SPDX manifest
-// carries a "subject" field pointing to the image digest, so the image digest ends
-// up in the referenced set, leaving the SPDX manifest as the unique root.
-//
-// Returns -1 and an error if no unique root can be determined.
-func findRootManifestIndex(ctx context.Context, ociStore *CloseableReadOnlyStore) (int, error) {
-	// Build a set of all digests that appear as children of any manifest in the index
-	// (config, layers, child manifests, subject). Any manifest whose own digest appears
-	// here is a dependency of some other manifest, not the root.
-	referenced := make(map[string]struct{}, len(ociStore.Index.Manifests)*4)
-	for _, desc := range ociStore.Index.Manifests {
-		r, err := ociStore.Fetch(ctx, desc)
-		if err != nil {
-			return -1, fmt.Errorf("failed to fetch manifest %s for root identification: %w", desc.Digest, err)
-		}
-		raw, err := content.ReadAll(r, desc)
-		_ = r.Close()
-		if err != nil {
-			return -1, fmt.Errorf("failed to read manifest %s for root identification: %w", desc.Digest, err)
-		}
-
-		// Try as OCI/Docker image manifest: captures config, layers, and subject.
-		// Both formats share identical field names, so OCI parsing works for Docker too.
-		var manifest ociImageSpecV1.Manifest
-		if err := json.Unmarshal(raw, &manifest); err == nil {
-			if manifest.Config.Digest != "" {
-				referenced[manifest.Config.Digest.String()] = struct{}{}
-			}
-			for _, layer := range manifest.Layers {
-				if layer.Digest != "" {
-					referenced[layer.Digest.String()] = struct{}{}
-				}
-			}
-			if manifest.Subject != nil && manifest.Subject.Digest != "" {
-				referenced[manifest.Subject.Digest.String()] = struct{}{}
-			}
-		}
-
-		// Also try as OCI image index to capture child platform manifest digests.
-		var index ociImageSpecV1.Index
-		if err := json.Unmarshal(raw, &index); err == nil {
-			for _, m := range index.Manifests {
-				if m.Digest != "" {
-					referenced[m.Digest.String()] = struct{}{}
-				}
-			}
-			if index.Subject != nil && index.Subject.Digest != "" {
-				referenced[index.Subject.Digest.String()] = struct{}{}
-			}
-		}
-	}
-
-	// A manifest whose own digest was not referenced by any other manifest is a root.
-	var rootIndices []int
-	for idx, desc := range ociStore.Index.Manifests {
-		if _, ok := referenced[desc.Digest.String()]; !ok {
-			rootIndices = append(rootIndices, idx)
-		}
-	}
-
-	if len(rootIndices) == 1 {
-		return rootIndices[0], nil
-	}
-	return -1, fmt.Errorf(
-		"found %d root manifests (expected exactly 1) after reference-count analysis of %d manifests",
-		len(rootIndices), len(ociStore.Index.Manifests),
-	)
-}
 
 // extractSubjectAndSuccessors decodes desc once and returns its subject (nil if desc is not a
 // referrer) and its containment successors (config+layers, child manifests, or
