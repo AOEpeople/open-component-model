@@ -538,25 +538,6 @@ func (repo *Repository) localArtifact(ctx context.Context, component, version st
 			}
 		}
 	}
-	// When subset matching is ambiguous, prefer an exact identity match. Some component
-	// descriptors (e.g. Gardener v1.144.x) reuse an element name for an executable resource and
-	// its SBOM attachments, distinguishing the SBOMs only by an extra "sbom-format" identity
-	// attribute. The executable's identity is then a proper subset of the SBOMs' identities, so
-	// IdentitySubset matching returns all of them. When the requested identity exactly matches one
-	// candidate, that candidate is the intended element. Subset matching is preserved for
-	// genuinely partial lookups (e.g. requesting "name=x" without a version).
-	if len(candidates) > 1 {
-		var exact []descriptor.Artifact
-		for _, c := range candidates {
-			meta := c.GetElementMeta()
-			if meta.ToIdentity().Equal(identity) {
-				exact = append(exact, c)
-			}
-		}
-		if len(exact) == 1 {
-			candidates = exact
-		}
-	}
 	if len(candidates) != 1 {
 		return nil, nil, fmt.Errorf("found %d candidates while looking for %s %q, but expected exactly one", len(candidates), kind, identity)
 	}
